@@ -1,2 +1,6 @@
 requests
-bs4
+beautifulsoup4
+pdfplumber
+pypdf
+PyMuPDF
+pytest
