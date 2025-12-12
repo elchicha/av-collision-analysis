@@ -1,13 +1,15 @@
 import logging
 import re
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-
-import sys
-from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Setup logging to write to log directory
 log_dir = Path(__file__).parent / "logs"
@@ -36,16 +38,39 @@ class CollisionReportDownloader:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "av-collision-analysis/1.0"
+        })
+        retries = Retry(
+            total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD")
+        )
+        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=retries)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        self.timeout = (5, 30)
+
+    def _dest_path_for(self, url:str) -> bool:
+        """" Check if filename has already been downloaded. """
+        filename_url = Path(urlparse(url).path).name
+        dest_path = self.output_dir / filename_url
+        if dest_path.exists() and dest_path.is_dir():
+            pdf_files = list(dest_path.glob("*.pdf"))
+            if len(pdf_files) == 1:
+                return True
+        return False
+
     def fetch_report_urls(self) -> list[str]:
         """Fetches a list of PDF URLs from the main page."""
         try:
-            page = requests.get(self.REPORTS_URL)
+            page = self.session.get(self.REPORTS_URL, timeout=self.timeout)
             page.raise_for_status()
         except requests.RequestException as e:
             logger.error(f"Failed to load page: {e}")
             return []
 
-        soup = BeautifulSoup(page.content, "html.parser")
+        soup = BeautifulSoup(page.content, "lxml")
         
         # Find all accordion blocks
         accordion_blocks = soup.find_all(id=re.compile("acc-.*"))
@@ -59,7 +84,8 @@ class CollisionReportDownloader:
                     href = self.SITE_URL + href
                 # Basic validation to ensure we are grabbing PDFs
                 if "pdf" in href.strip().lower():
-                    reports.append(href)
+                    if not self._dest_path_for(href):
+                        reports.append(href)
 
         return reports
 
@@ -70,23 +96,23 @@ class CollisionReportDownloader:
             parsed_url = urlparse(url)
             filename_url = Path(parsed_url.path).name
 
-            response = requests.get(url, stream=True)
+            response = self.session.get(url, stream=True, timeout=self.timeout)
             response.raise_for_status()
-            d = response.headers['content-disposition']
-            filename: str = re.findall("filename=(.+)", d)[0]
 
+            cont_disp = response.headers['content-disposition']
+            filename: str = re.findall("filename=(.+)", cont_disp)[0]
             destination = self.output_dir / filename_url / filename
 
             if destination.exists():
-                logger.info(f"Skipping {filename}, already exists.")
+                logger.warning(f"Skipping {filename}, already exists.")
                 return destination
 
             logger.info(f"Downloading: {filename}")
-
             destination.parent.mkdir(parents=True, exist_ok=True)
+
+            response.raw.decode_content = True
             with open(destination, "wb") as f:
-                for chunk in response.iter_content(chunk_size=32764):
-                    f.write(chunk)
+                shutil.copyfileobj(response.raw, f, length=1024 * 1024)
 
             logger.info(f"Successfully downloaded: {filename}")
             return destination
@@ -100,5 +126,12 @@ class CollisionReportDownloader:
         report_urls = self.fetch_report_urls()
         logger.info(f"Found {len(report_urls)} reports.")
 
-        for url in report_urls:
-            self.download_report(url)
+        max_workers = min(16, max(4, (len(report_urls) // 10) or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self.download_report, url): url for url in report_urls}
+            for fut in as_completed(futures):
+                url = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.error(f"Failed {url}: {e}")
